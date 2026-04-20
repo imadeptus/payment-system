@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package payment;
+
+// gRPC сервис
+service PaymentService {
+  rpc CreatePayment(PaymentRequest) returns (PaymentResponse);
+}
+
+// Запрос
+message PaymentRequest {
+  int32 amount = 1;
+  string idempotency_key = 2;
+}
+
+// Ответ
+message PaymentResponse {
+  string id = 1;
+  string status = 2;
+  string idempotency_key = 3;
+}
