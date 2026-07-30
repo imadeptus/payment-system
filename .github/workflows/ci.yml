@@ -46,6 +46,7 @@ jobs:
       - name: Unit and PostgreSQL integration coverage
         env:
           TEST_DATABASE_URL: postgresql+asyncpg://saga:saga-local-only@127.0.0.1:55439/postgres
+          TEST_KAFKA_BOOTSTRAP_SERVERS: 127.0.0.1:19092
         run: >-
           pytest tests/unit tests/integration
           --cov=libs --cov=services
@@ -56,6 +57,7 @@ jobs:
       - name: Containerized Kafka and failure-path tests
         env:
           E2E_ORDER_BASE_URL: http://127.0.0.1:18000
+          E2E_KAFKA_BOOTSTRAP_SERVERS: 127.0.0.1:19092
           E2E_RUN_RECOVERY: "1"
         run: pytest tests/e2e -q
       - name: Compose diagnostics
