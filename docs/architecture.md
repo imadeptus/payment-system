@@ -94,11 +94,13 @@ idempotent processing, not exactly once.
 | Background worker exits unexpectedly | readiness becomes false and the process receives `SIGTERM` |
 | SIGTERM | supervised tasks are cancelled; Kafka producer/consumer and DB engine are closed |
 
-DLQ records contain the original envelope, error class, attempt count,
-correlation and causation identifiers. They contain neither stack traces nor
-credentials. Decoded poison records retain only allowlisted envelope metadata,
-not arbitrary payload or extra fields. Operator tooling and automated DLQ
-replay are outside this repository's scope.
+DLQ records contain allowlisted envelope metadata, error class, attempt count,
+correlation and causation identifiers. Typed retry records retain only payload
+fields validated for their message type; decoded poison records retain no
+payload or extra fields. Malformed JSON is represented only by SHA-256 and byte
+length, never raw content. Records contain neither stack traces nor
+credentials. Operator tooling and automated DLQ replay are outside this
+repository's scope.
 
 ## Operational model
 
@@ -107,6 +109,9 @@ replay are outside this repository's scope.
 - retry counts, parsed positive backoff delays and positive Outbox limits are
   validated at startup;
 - Alembic runs as one-off migration jobs before each service starts;
+- the Payment correlation migration preserves legacy rows as nullable; the
+  first matching refund binds a legacy row only after order, amount and
+  currency validation;
 - logs are structured JSON written to stdout;
 - liveness is process-only; readiness requires both DB and Kafka;
 - Kafka consumers signal readiness only after connecting to the broker;

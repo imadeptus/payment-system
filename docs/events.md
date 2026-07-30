@@ -92,12 +92,14 @@ detected, the consumer publishes:
 }
 ```
 
-For an exhausted retry, `original_message` is the typed, validated envelope.
-For a decoded poison message it contains only allowlisted envelope metadata;
-arbitrary payload and extra fields are discarded. Only syntactically invalid
-JSON uses a truncated raw fragment. `reason` is a sanitized exception class
-rather than a stack trace or secret-bearing exception string. The consumer
-commits its Kafka offset only after this DLQ publish succeeds.
+For an exhausted retry, `original_message` contains allowlisted envelope
+metadata and only fields validated by the payload model for its
+`message_type`. For a decoded poison message it contains only the envelope
+metadata; arbitrary payload and extra fields are discarded. Syntactically
+invalid JSON stores only `raw_sha256` and `raw_size_bytes`, never raw content.
+`reason` is a sanitized exception class rather than a stack trace or
+secret-bearing exception string. The consumer commits its Kafka offset only
+after this DLQ publish succeeds.
 
 For an exhausted `RefundPayment`, Payment additionally publishes a
 deterministic `PaymentRefundFailed` event with the same Saga identifiers. Its

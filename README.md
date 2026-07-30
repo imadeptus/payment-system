@@ -198,6 +198,9 @@ terminal technical failure is published to the DLQ. Malformed envelopes and
 business-message validation failures also go to the DLQ without terminating
 the consumer loop. Domain failures are explicit events (`PaymentRejected`,
 `InventoryRejected`, `PaymentRefundFailed`) rather than retryable exceptions.
+Malformed JSON is represented by hash and byte length only; decoded poison and
+transient records use envelope/payload allowlists, so arbitrary secret-bearing
+fields are not copied into the DLQ.
 Retry attempts, positive delays and Outbox timing/batch limits are validated
 before a service starts. Each configured delay receives up to 20% additive
 jitter, capped at one second.
