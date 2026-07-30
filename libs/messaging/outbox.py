@@ -2,7 +2,6 @@
 
 from typing import Any
 
-from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from libs.contracts import MessageEnvelope, topic_for
@@ -10,7 +9,7 @@ from libs.contracts import MessageEnvelope, topic_for
 
 def enqueue(
     session: AsyncSession,
-    envelope: MessageEnvelope[BaseModel],
+    envelope: MessageEnvelope[Any],
     *,
     outbox_model: type[Any] | None = None,
 ) -> None:
