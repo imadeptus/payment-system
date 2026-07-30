@@ -96,8 +96,9 @@ idempotent processing, not exactly once.
 
 DLQ records contain the original envelope, error class, attempt count,
 correlation and causation identifiers. They contain neither stack traces nor
-credentials. Operator tooling and automated DLQ replay are outside this
-repository's scope.
+credentials. Decoded poison records retain only allowlisted envelope metadata,
+not arbitrary payload or extra fields. Operator tooling and automated DLQ
+replay are outside this repository's scope.
 
 ## Operational model
 

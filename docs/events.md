@@ -92,9 +92,12 @@ detected, the consumer publishes:
 }
 ```
 
-`original_message` is the validated envelope. `reason` is a sanitized exception
-class rather than a stack trace or secret-bearing exception string. The
-consumer commits its Kafka offset only after this DLQ publish succeeds.
+For an exhausted retry, `original_message` is the typed, validated envelope.
+For a decoded poison message it contains only allowlisted envelope metadata;
+arbitrary payload and extra fields are discarded. Only syntactically invalid
+JSON uses a truncated raw fragment. `reason` is a sanitized exception class
+rather than a stack trace or secret-bearing exception string. The consumer
+commits its Kafka offset only after this DLQ publish succeeds.
 
 For an exhausted `RefundPayment`, Payment additionally publishes a
 deterministic `PaymentRefundFailed` event with the same Saga identifiers. Its
