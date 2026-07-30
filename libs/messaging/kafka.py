@@ -1,6 +1,7 @@
 """Async Kafka producer transport and manual-commit consumer loop."""
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, cast
@@ -10,25 +11,7 @@ from pydantic import ValidationError
 
 from libs.contracts import MessageEnvelope
 from libs.messaging.retry import BusinessMessageError, DlqPublisher, consume_with_retry
-
-DLQ_ENVELOPE_METADATA_FIELDS = (
-    "message_id",
-    "message_type",
-    "schema_version",
-    "occurred_at",
-    "correlation_id",
-    "causation_id",
-    "order_id",
-)
-
-
-def sanitize_poison_message(raw: dict[str, Any]) -> dict[str, Any]:
-    """Retain routing metadata without copying arbitrary poison payload fields."""
-
-    return {
-        field: raw.get(field)
-        for field in DLQ_ENVELOPE_METADATA_FIELDS
-    }
+from libs.messaging.sanitization import sanitize_decoded_message
 
 
 class KafkaTransport:
@@ -111,12 +94,16 @@ async def consume_forever(
                 await dlq(
                     {
                         "original_message": (
-                            sanitize_poison_message(raw)
+                            sanitize_decoded_message(
+                                raw,
+                                include_validated_payload=False,
+                            )
                             if raw is not None
                             else {
-                                "raw": record.value.decode(
-                                    errors="replace",
-                                )[:4096]
+                                "raw_sha256": hashlib.sha256(
+                                    record.value
+                                ).hexdigest(),
+                                "raw_size_bytes": len(record.value),
                             }
                         ),
                         "reason": type(exc).__name__,

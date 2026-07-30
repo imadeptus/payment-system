@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -173,6 +174,7 @@ async def test_consumer_signals_only_after_broker_start(
 async def test_poison_record_goes_to_dlq_and_next_record_is_processed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    secret_poison = b'{"password":"do-not-leak"'
     valid = {
         "message_id": "00000000-0000-0000-0000-000000000711",
         "message_type": "AuthorizePayment",
@@ -185,7 +187,7 @@ async def test_poison_record_goes_to_dlq_and_next_record_is_processed(
     }
     records = [
         SimpleNamespace(
-            value=b"{invalid-json",
+            value=secret_poison,
             topic="payments.commands.v1",
             partition=0,
             offset=8,
@@ -222,7 +224,12 @@ async def test_poison_record_goes_to_dlq_and_next_record_is_processed(
     assert len(dlq_records) == 1
     assert dlq_records[0]["reason"] == "JSONDecodeError"
     assert dlq_records[0]["attempts"] == 1
-    assert dlq_records[0]["original_message"] == {"raw": "{invalid-json"}
+    assert dlq_records[0]["original_message"] == {
+        "raw_sha256": hashlib.sha256(secret_poison).hexdigest(),
+        "raw_size_bytes": len(secret_poison),
+    }
+    assert "password" not in str(dlq_records[0])
+    assert "do-not-leak" not in str(dlq_records[0])
     assert len(consumer.commits) == 2
 
 
@@ -232,7 +239,7 @@ async def test_business_poison_goes_to_dlq_without_stopping_consumer(
 ) -> None:
     unknown = {
         "message_id": "00000000-0000-0000-0000-000000000721",
-        "message_type": "Unknown",
+        "message_type": "password=do-not-leak",
         "schema_version": 1,
         "occurred_at": "2026-07-30T08:00:00Z",
         "correlation_id": "00000000-0000-0000-0000-000000000722",
@@ -241,7 +248,16 @@ async def test_business_poison_goes_to_dlq_without_stopping_consumer(
         "payload": {"password": "do-not-leak"},
         "authorization": "Bearer do-not-leak",
     }
-    valid = {**unknown, "message_id": "00000000-0000-0000-0000-000000000724"}
+    valid = {
+        "message_id": "00000000-0000-0000-0000-000000000724",
+        "message_type": "AuthorizePayment",
+        "schema_version": 1,
+        "occurred_at": "2026-07-30T08:00:00Z",
+        "correlation_id": "00000000-0000-0000-0000-000000000725",
+        "causation_id": None,
+        "order_id": "00000000-0000-0000-0000-000000000726",
+        "payload": {"amount_minor": 100, "currency": "RUB"},
+    }
     records = [
         SimpleNamespace(
             value=json.dumps(unknown).encode(),
@@ -286,7 +302,7 @@ async def test_business_poison_goes_to_dlq_without_stopping_consumer(
     assert dlq_records[0]["correlation_id"] == unknown["correlation_id"]
     assert dlq_records[0]["original_message"] == {
         "message_id": unknown["message_id"],
-        "message_type": "Unknown",
+        "message_type": "unknown",
         "schema_version": 1,
         "occurred_at": "2026-07-30T08:00:00Z",
         "correlation_id": unknown["correlation_id"],

@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 from libs.contracts import MessageEnvelope
+from libs.messaging.sanitization import sanitize_decoded_message
 
 MessageHandler = Callable[[MessageEnvelope[Any]], Awaitable[None]]
 DlqPublisher = Callable[[dict[str, Any]], Awaitable[None]]
@@ -57,7 +58,10 @@ async def consume_with_retry(
 
     await dlq(
         {
-            "original_message": envelope.model_dump(mode="json"),
+            "original_message": sanitize_decoded_message(
+                envelope.model_dump(mode="json"),
+                include_validated_payload=True,
+            ),
             "reason": type(terminal_error).__name__,
             "attempts": attempts,
             "correlation_id": str(envelope.correlation_id),

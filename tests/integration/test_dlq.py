@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 from typing import Any
@@ -68,7 +69,8 @@ async def test_real_kafka_poison_record_reaches_dlq_and_consumer_continues() -> 
             "order_id": str(uuid4()),
             "payload": {"amount_minor": 100, "currency": "RUB"},
         }
-        await producer.send_and_wait(input_topic, b"{invalid-json")
+        secret_poison = b'{"password":"do-not-leak"'
+        await producer.send_and_wait(input_topic, secret_poison)
         await producer.send_and_wait(input_topic, json.dumps(valid).encode())
 
         await asyncio.wait_for(handled_event.wait(), timeout=15.0)
@@ -77,7 +79,12 @@ async def test_real_kafka_poison_record_reaches_dlq_and_consumer_continues() -> 
 
         assert handled == [valid]
         assert dlq_value["reason"] == "JSONDecodeError"
-        assert dlq_value["original_message"] == {"raw": "{invalid-json"}
+        assert dlq_value["original_message"] == {
+            "raw_sha256": hashlib.sha256(secret_poison).hexdigest(),
+            "raw_size_bytes": len(secret_poison),
+        }
+        assert "password" not in str(dlq_value)
+        assert "do-not-leak" not in str(dlq_value)
         assert worker.done() is False
     finally:
         worker.cancel()

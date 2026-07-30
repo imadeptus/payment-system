@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 from uuid import UUID, uuid4
@@ -33,11 +34,12 @@ async def test_payment_consumer_survives_poison_record(
     producer = AIOKafkaProducer(bootstrap_servers=bootstrap_servers)
     await dlq_consumer.start()
     await producer.start()
+    secret_poison = b'{"password":"do-not-leak"'
     try:
         await dlq_consumer.getmany(timeout_ms=1_000)
         await producer.send_and_wait(
             "payments.commands.v1",
-            value=b"{invalid-json",
+            value=secret_poison,
         )
 
         loop = asyncio.get_running_loop()
@@ -51,13 +53,20 @@ async def test_payment_consumer_survives_poison_record(
                     if (
                         candidate.get("reason") == "JSONDecodeError"
                         and candidate.get("original_message")
-                        == {"raw": "{invalid-json"}
+                        == {
+                            "raw_sha256": hashlib.sha256(
+                                secret_poison
+                            ).hexdigest(),
+                            "raw_size_bytes": len(secret_poison),
+                        }
                     ):
                         poison_dlq = candidate
                         break
             if poison_dlq is not None:
                 break
         assert poison_dlq is not None
+        assert "password" not in str(poison_dlq)
+        assert "do-not-leak" not in str(poison_dlq)
     finally:
         await producer.stop()
         await dlq_consumer.stop()

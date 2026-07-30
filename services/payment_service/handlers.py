@@ -121,10 +121,13 @@ async def handle_refund(
                 f"Payment not found for order {envelope.order_id}"
             )
         if (
-            payment.correlation_id != envelope.correlation_id
-            or payment.amount_minor != envelope.payload.amount_minor
+            payment.amount_minor != envelope.payload.amount_minor
             or payment.currency != envelope.payload.currency
         ):
+            raise BusinessMessageError("RefundPayment does not match stored Payment")
+        if payment.correlation_id is None:
+            payment.correlation_id = envelope.correlation_id
+        elif payment.correlation_id != envelope.correlation_id:
             raise BusinessMessageError("RefundPayment does not match stored Payment")
         if payment.status in {"REFUNDED", "REFUND_FAILED"}:
             return

@@ -86,6 +86,41 @@ async def test_retry_adds_bounded_injectable_jitter() -> None:
 
 
 @pytest.mark.asyncio
+async def test_transient_dlq_keeps_only_validated_payload_fields() -> None:
+    dlq_records: list[dict[str, Any]] = []
+    raw = envelope().model_dump(mode="json")
+    raw["payload"]["password"] = "do-not-leak"
+    unsafe_envelope = MessageEnvelope[Any].model_validate(raw)
+
+    async def failing_handler(_: MessageEnvelope[Any]) -> None:
+        raise TransientMessageError("temporary")
+
+    async def record_dlq(record: dict[str, Any]) -> None:
+        dlq_records.append(record)
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    await consume_with_retry(
+        unsafe_envelope,
+        failing_handler,
+        record_dlq,
+        attempts=1,
+        delays=(0.0,),
+        sleep=no_sleep,
+        random_fraction=lambda: 0.0,
+    )
+
+    terminal_record = dlq_records[-1]
+    assert terminal_record["original_message"]["payload"] == {
+        "amount_minor": 500,
+        "currency": "RUB",
+    }
+    assert "password" not in str(terminal_record)
+    assert "do-not-leak" not in str(terminal_record)
+
+
+@pytest.mark.asyncio
 async def test_business_rejection_is_not_retried_or_sent_to_dlq() -> None:
     calls = 0
     dlq_records: list[dict[str, Any]] = []

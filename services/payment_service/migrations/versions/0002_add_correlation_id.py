@@ -2,6 +2,11 @@
 
 Revision ID: 0002_payment_correlation
 Revises: 0001_payment_init
+
+The column remains nullable so rolling upgrades can preserve pre-existing
+payments whose historical Saga identifier is unavailable. New authorizations
+always populate it; a matching refund binds a legacy NULL after validating the
+order identifier, amount and currency.
 """
 
 from collections.abc import Sequence
@@ -16,8 +21,6 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    # Existing demonstration rows cannot be backfilled safely because the
-    # previous schema did not retain Saga correlation. New writes always set it.
     op.add_column(
         "payments",
         sa.Column("correlation_id", sa.Uuid(), nullable=True),

@@ -215,3 +215,44 @@ async def test_rejected_payment_cannot_be_refunded() -> None:
     assert payment.status == "REJECTED"
     assert payment.history == ["REJECTED"]
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_refund_binds_legacy_payment_without_correlation_id() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    correlation_id = UUID("00000000-0000-0000-0000-000000000172")
+    refund = MessageEnvelope[RefundPayment](
+        message_id=UUID("00000000-0000-0000-0000-000000000173"),
+        message_type="RefundPayment",
+        occurred_at=datetime(2026, 7, 30, 8, 1, tzinfo=UTC),
+        correlation_id=correlation_id,
+        causation_id=UUID("00000000-0000-0000-0000-000000000171"),
+        order_id=ORDER_ID,
+        payload=RefundPayment(amount_minor=12_500, currency="RUB"),
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            session.add(
+                Payment(
+                    order_id=ORDER_ID,
+                    correlation_id=None,
+                    amount_minor=12_500,
+                    currency="RUB",
+                    status="AUTHORIZED",
+                    provider_reference=f"sim-{ORDER_ID}",
+                    history=["AUTHORIZED"],
+                )
+            )
+
+    async with session_factory() as session:
+        await handle_refund(session, refund, PaymentProvider())
+    async with session_factory() as session:
+        payment = await session.scalar(select(Payment))
+
+    assert payment is not None
+    assert payment.correlation_id == correlation_id
+    assert payment.status == "REFUNDED"
+    await engine.dispose()
