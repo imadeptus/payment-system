@@ -7,7 +7,9 @@ from uuid import UUID
 from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from starlette.types import Lifespan
 
+from libs.runtime import Readiness, add_health_routes
 from services.order_service.models import Order
 from services.order_service.repository import (
     IdempotencyConflict,
@@ -38,8 +40,15 @@ class OrderResponse(BaseModel):
 SessionFactory = async_sessionmaker[AsyncSession]
 
 
-def create_app(session_factory: SessionFactory) -> FastAPI:
-    app = FastAPI(title="Order Service", version="1.0.0")
+def create_app(
+    session_factory: SessionFactory,
+    *,
+    lifespan: Lifespan[FastAPI] | None = None,
+    readiness: Readiness | None = None,
+) -> FastAPI:
+    app = FastAPI(title="Order Service", version="1.0.0", lifespan=lifespan)
+    if readiness is not None:
+        add_health_routes(app, readiness)
 
     async def session_dependency() -> AsyncIterator[AsyncSession]:
         async with session_factory() as session:

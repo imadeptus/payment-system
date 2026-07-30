@@ -14,24 +14,30 @@ class KafkaTransport:
     """Small aiokafka producer wrapper used by OutboxPublisher."""
 
     def __init__(self, bootstrap_servers: str, *, client_id: str) -> None:
-        self._producer = AIOKafkaProducer(
-            bootstrap_servers=bootstrap_servers,
-            client_id=client_id,
+        self._bootstrap_servers = bootstrap_servers
+        self._client_id = client_id
+        self._producer: AIOKafkaProducer | None = None
+
+    async def start(self) -> None:
+        if self._producer is not None:
+            return
+        producer = AIOKafkaProducer(
+            bootstrap_servers=self._bootstrap_servers,
+            client_id=self._client_id,
             acks="all",
             enable_idempotence=True,
         )
-        self._started = False
-
-    async def start(self) -> None:
-        await self._producer.start()
-        self._started = True
+        await producer.start()
+        self._producer = producer
 
     async def stop(self) -> None:
-        if self._started:
+        if self._producer is not None:
             await self._producer.stop()
-            self._started = False
+            self._producer = None
 
     async def publish(self, topic: str, key: bytes, value: bytes) -> None:
+        if self._producer is None:
+            raise RuntimeError("KafkaTransport is not started")
         await self._producer.send_and_wait(topic, value=value, key=key)
 
 
@@ -42,6 +48,8 @@ async def consume_forever(
     group_id: str,
     handler: Callable[[dict[str, Any]], Awaitable[None]],
     dlq: DlqPublisher,
+    attempts: int = 3,
+    delays: Sequence[float] = (1.0, 2.0, 4.0),
 ) -> None:
     """Consume with manual offsets committed after handling or DLQ success."""
 
@@ -64,7 +72,13 @@ async def consume_forever(
             ) -> None:
                 await handler(raw_message)
 
-            await consume_with_retry(envelope, typed_handler, dlq)
+            await consume_with_retry(
+                envelope,
+                typed_handler,
+                dlq,
+                attempts=attempts,
+                delays=delays,
+            )
             await consumer.commit()
     finally:
         await consumer.stop()

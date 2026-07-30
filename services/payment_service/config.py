@@ -14,3 +14,8 @@ class PaymentSettings(BaseSettings):
     dlq_topic: str = "saga.dlq.v1"
     reject_order_ids: str = ""
     refund_failure_order_ids: str = ""
+    message_retry_attempts: int = 3
+    message_backoff_seconds: str = "1,2,4"
+    outbox_poll_seconds: float = 0.5
+    outbox_batch_size: int = 100
+    log_level: str = "INFO"
