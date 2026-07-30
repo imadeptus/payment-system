@@ -85,12 +85,14 @@ idempotent processing, not exactly once.
 | Duplicate `POST /orders`, same key/body | returns the existing order |
 | Same key, different body | HTTP `409` |
 | Duplicate Kafka message | Inbox claim returns no-op; offset can be committed |
-| Temporary handler/database error | bounded retries using configured delays |
+| Temporary handler/database error | bounded retries using configured delays plus up to 20% jitter, capped at one second |
+| Malformed or invalid message | sanitized record published to `saga.dlq.v1`; consumer continues |
 | Retries exhausted | sanitized record published to `saga.dlq.v1`, then offset committed |
 | Payment or stock business rejection | explicit domain event; no technical retry |
-| Simulated refund failure | `PaymentRefundFailed` and Saga `MANUAL_REVIEW` |
-| Consumer outage | producer's Outbox persists; processing resumes after restart |
-| SIGTERM | tasks are cancelled; Kafka producer/consumer and DB engine are closed |
+| Refund retries exhausted | deterministic `PaymentRefundFailed` is broker-acknowledged before offset commit; Saga enters `MANUAL_REVIEW` |
+| Consumer outage | Kafka retains the published command; processing resumes after restart |
+| Background worker exits unexpectedly | readiness becomes false and the process receives `SIGTERM` |
+| SIGTERM | supervised tasks are cancelled; Kafka producer/consumer and DB engine are closed |
 
 DLQ records contain the original envelope, error class, attempt count,
 correlation and causation identifiers. They contain neither stack traces nor
@@ -101,14 +103,17 @@ repository's scope.
 
 - configuration, topic names, credentials and timing values come from
   environment variables;
+- retry counts, parsed positive backoff delays and positive Outbox limits are
+  validated at startup;
 - Alembic runs as one-off migration jobs before each service starts;
 - logs are structured JSON written to stdout;
 - liveness is process-only; readiness requires both DB and Kafka;
+- Kafka consumers signal readiness only after connecting to the broker;
 - container images use a Python 3.11 builder and an unprivileged runtime user
   (`10001:10001`);
 - application shutdown is bounded by the Compose grace period;
 - service container ports are `8000`, `8001`, `8002`; local host mappings are
-  `18000`, `18001`, `18002`.
+  `18000`, `18001`, `18002`; Kafka's host-side test listener is `19092`.
 
 This topology is suitable for deterministic local and CI verification. It is
 not a production deployment design: it has one broker, one database server,

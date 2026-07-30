@@ -15,18 +15,19 @@ owns a PostgreSQL database.
   and `MANUAL_REVIEW`;
 - atomic domain changes and message creation through Transactional Outbox;
 - safe at-least-once consumption through an Inbox unique on `message_id`;
-- bounded technical retries, sanitized DLQ records and manual Kafka offset
-  commits;
-- HTTP idempotency for order creation;
-- recovery after a consumer restart and duplicate Kafka delivery;
+- bounded technical retries with limited jitter, sanitized DLQ records and
+  manual Kafka offset commits;
+- concurrency-safe HTTP idempotency for order creation;
+- recovery after poison records, a consumer restart and duplicate Kafka
+  delivery;
 - async Python services, Alembic migrations, JSON stdout logs, readiness
   checks and graceful shutdown;
 - multi-stage, non-root Docker images.
 
 ## Quick start
 
-Requirements: Docker with the Compose plugin. Host ports `18000`–`18002` and
-`55439` must be available.
+Requirements: Docker with the Compose plugin. Host ports `18000`–`18002`,
+`19092` and `55439` must be available.
 
 ```bash
 docker compose up -d --build --wait
@@ -125,7 +126,8 @@ More detail is in [Architecture](docs/architecture.md) and
 |---|---|---|
 | Happy path | `sku=IN-STOCK` | one authorization, one reservation, `CONFIRMED` |
 | Compensation | `sku=OUT-OF-STOCK` | authorization, rejection, refund, `CANCELLED` |
-| Recovery/idempotency | duplicate HTTP/Kafka delivery or inventory consumer restart | one effective side effect; persisted Outbox resumes processing |
+| Technical refund failure | `sku=OUT-OF-STOCK`, `amount_minor=7777` | retries and DLQ, durable `PaymentRefundFailed`, `MANUAL_REVIEW` |
+| Recovery/idempotency | poison record, duplicate HTTP/Kafka delivery or inventory consumer restart | consumer continues; one effective side effect; Kafka-retained command resumes processing |
 
 The E2E suite checks both API status and the three service databases.
 
@@ -137,8 +139,10 @@ The E2E suite checks both API status and the three service databases.
 | Payment health | `http://localhost:18001/health/ready` |
 | Inventory health | `http://localhost:18002/health/ready` |
 | PostgreSQL | `localhost:55439` |
+| Kafka external listener | `localhost:19092` |
 
-Kafka is internal to the Compose network. Service container ports remain
+Services use Kafka's internal listener at `kafka:9092`; host-side tests use
+the external listener at `localhost:19092`. Service container ports remain
 `8000`, `8001` and `8002`.
 
 ## Validation
@@ -163,6 +167,7 @@ Run unit and PostgreSQL integration tests with branch coverage:
 ```bash
 docker compose up -d --wait postgres kafka
 TEST_DATABASE_URL=postgresql+asyncpg://saga:saga-local-only@127.0.0.1:55439/postgres \
+TEST_KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:19092 \
   .venv/bin/pytest tests/unit tests/integration \
   --cov=libs --cov=services --cov-report=term-missing --cov-fail-under=80
 ```
@@ -171,7 +176,9 @@ Run all containerized failure-path tests, including consumer restart:
 
 ```bash
 docker compose up -d --build --wait
-E2E_ORDER_BASE_URL=http://127.0.0.1:18000 E2E_RUN_RECOVERY=1 \
+E2E_ORDER_BASE_URL=http://127.0.0.1:18000 \
+E2E_KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:19092 \
+E2E_RUN_RECOVERY=1 \
   .venv/bin/pytest tests/e2e -q
 docker compose down -v
 ```
@@ -187,13 +194,20 @@ Kafka broker acknowledgement but before setting `published_at`, so the same
 constraints make that replay safe.
 
 Offsets are committed only after a handler transaction succeeds or after a
-terminal technical failure is published to the DLQ. Business failures are
-domain events (`PaymentRejected`, `InventoryRejected`,
-`PaymentRefundFailed`) rather than retryable exceptions.
+terminal technical failure is published to the DLQ. Malformed envelopes and
+business-message validation failures also go to the DLQ without terminating
+the consumer loop. Domain failures are explicit events (`PaymentRejected`,
+`InventoryRejected`, `PaymentRefundFailed`) rather than retryable exceptions.
+Retry attempts, positive delays and Outbox timing/batch limits are validated
+before a service starts. Each configured delay receives up to 20% additive
+jitter, capped at one second.
 
-`PaymentRefundFailed` moves the Saga to `MANUAL_REVIEW`. A generic technical
-failure that exhausts retries is preserved in `saga.dlq.v1`; this demonstration
-does not include a DLQ operator or automatic replay.
+When technical retries for `RefundPayment` are exhausted, Payment first
+publishes the sanitized DLQ record and then a deterministic, broker-acknowledged
+`PaymentRefundFailed` event before committing the command offset. The event
+moves the Saga to `MANUAL_REVIEW`; replay is safe because it uses a stable
+`message_id`. Other exhausted technical failures remain in `saga.dlq.v1`.
+This demonstration does not include a DLQ operator or automatic replay.
 
 ## Scope and limitations
 

@@ -64,7 +64,9 @@ message routing remains stable by `message_type`.
 | `InventoryReleased` | `sku`, `quantity` |
 | `InventoryReleaseFailed` | `sku`, `quantity`, `reason` |
 
-Business rejections use explicit events and are not sent to the technical DLQ.
+Domain rejections use explicit events and are not sent to the technical DLQ.
+Messages whose envelope or aggregate fields fail validation are poison records
+and are sent to the DLQ without stopping the consumer.
 
 ## Compatibility rules
 
@@ -77,7 +79,8 @@ Business rejections use explicit events and are not sent to the technical DLQ.
 
 ## DLQ record
 
-After configured transient retries are exhausted, the consumer publishes:
+After configured transient retries are exhausted, or after a poison record is
+detected, the consumer publishes:
 
 ```json
 {
@@ -92,3 +95,8 @@ After configured transient retries are exhausted, the consumer publishes:
 `original_message` is the validated envelope. `reason` is a sanitized exception
 class rather than a stack trace or secret-bearing exception string. The
 consumer commits its Kafka offset only after this DLQ publish succeeds.
+
+For an exhausted `RefundPayment`, Payment additionally publishes a
+deterministic `PaymentRefundFailed` event with the same Saga identifiers. Its
+broker acknowledgement is required before the command offset is committed, so
+Order can durably transition the Saga to `MANUAL_REVIEW`.
