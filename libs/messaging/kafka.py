@@ -11,6 +11,25 @@ from pydantic import ValidationError
 from libs.contracts import MessageEnvelope
 from libs.messaging.retry import BusinessMessageError, DlqPublisher, consume_with_retry
 
+DLQ_ENVELOPE_METADATA_FIELDS = (
+    "message_id",
+    "message_type",
+    "schema_version",
+    "occurred_at",
+    "correlation_id",
+    "causation_id",
+    "order_id",
+)
+
+
+def sanitize_poison_message(raw: dict[str, Any]) -> dict[str, Any]:
+    """Retain routing metadata without copying arbitrary poison payload fields."""
+
+    return {
+        field: raw.get(field)
+        for field in DLQ_ENVELOPE_METADATA_FIELDS
+    }
+
 
 class KafkaTransport:
     """Small aiokafka producer wrapper used by OutboxPublisher."""
@@ -92,7 +111,7 @@ async def consume_forever(
                 await dlq(
                     {
                         "original_message": (
-                            raw
+                            sanitize_poison_message(raw)
                             if raw is not None
                             else {
                                 "raw": record.value.decode(

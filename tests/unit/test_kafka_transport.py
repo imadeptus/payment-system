@@ -238,7 +238,8 @@ async def test_business_poison_goes_to_dlq_without_stopping_consumer(
         "correlation_id": "00000000-0000-0000-0000-000000000722",
         "causation_id": None,
         "order_id": "00000000-0000-0000-0000-000000000723",
-        "payload": {},
+        "payload": {"password": "do-not-leak"},
+        "authorization": "Bearer do-not-leak",
     }
     valid = {**unknown, "message_id": "00000000-0000-0000-0000-000000000724"}
     records = [
@@ -283,4 +284,16 @@ async def test_business_poison_goes_to_dlq_without_stopping_consumer(
     assert handled == [valid]
     assert dlq_records[0]["reason"] == "BusinessMessageError"
     assert dlq_records[0]["correlation_id"] == unknown["correlation_id"]
+    assert dlq_records[0]["original_message"] == {
+        "message_id": unknown["message_id"],
+        "message_type": "Unknown",
+        "schema_version": 1,
+        "occurred_at": "2026-07-30T08:00:00Z",
+        "correlation_id": unknown["correlation_id"],
+        "causation_id": None,
+        "order_id": unknown["order_id"],
+    }
+    assert "password" not in str(dlq_records[0])
+    assert "authorization" not in str(dlq_records[0])
+    assert "do-not-leak" not in str(dlq_records[0])
     assert len(consumer.commits) == 2
