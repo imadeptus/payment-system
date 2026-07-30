@@ -45,6 +45,7 @@ async def test_transient_failures_exhaust_backoff_and_preserve_dlq_metadata() ->
         attempts=3,
         delays=(1.0, 2.0, 4.0),
         sleep=no_sleep,
+        random_fraction=lambda: 0.0,
     )
 
     assert delays == [1.0, 2.0, 4.0]
@@ -56,6 +57,32 @@ async def test_transient_failures_exhaust_backoff_and_preserve_dlq_metadata() ->
     assert record["reason"] == "TransientMessageError"
     assert "password" not in str(record)
     assert "Traceback" not in str(record)
+
+
+@pytest.mark.asyncio
+async def test_retry_adds_bounded_injectable_jitter() -> None:
+    delays: list[float] = []
+
+    async def failing_handler(_: MessageEnvelope[Any]) -> None:
+        raise TransientMessageError("temporary")
+
+    async def no_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    async def ignore_dlq(_: dict[str, Any]) -> None:
+        return None
+
+    await consume_with_retry(
+        envelope(),
+        failing_handler,
+        ignore_dlq,
+        attempts=3,
+        delays=(1.0, 2.0, 10.0),
+        sleep=no_sleep,
+        random_fraction=lambda: 0.5,
+    )
+
+    assert delays == [1.1, 2.2, 10.5]
 
 
 @pytest.mark.asyncio

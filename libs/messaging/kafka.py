@@ -1,13 +1,15 @@
 """Async Kafka producer transport and manual-commit consumer loop."""
 
+import asyncio
 import json
 from collections.abc import Awaitable, Callable, Sequence
-from typing import Any
+from typing import Any, cast
 
-from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
+from pydantic import ValidationError
 
 from libs.contracts import MessageEnvelope
-from libs.messaging.retry import DlqPublisher, consume_with_retry
+from libs.messaging.retry import BusinessMessageError, DlqPublisher, consume_with_retry
 
 
 class KafkaTransport:
@@ -50,6 +52,7 @@ async def consume_forever(
     dlq: DlqPublisher,
     attempts: int = 3,
     delays: Sequence[float] = (1.0, 2.0, 4.0),
+    started_event: asyncio.Event | None = None,
 ) -> None:
     """Consume with manual offsets committed after handling or DLQ success."""
 
@@ -61,24 +64,60 @@ async def consume_forever(
         auto_offset_reset="earliest",
     )
     await consumer.start()
+    if started_event is not None:
+        started_event.set()
     try:
         async for record in consumer:
-            raw: dict[str, Any] = json.loads(record.value)
-            envelope = MessageEnvelope[Any].model_validate(raw)
+            raw: dict[str, Any] | None = None
+            try:
+                decoded: Any = json.loads(record.value)
+                envelope = MessageEnvelope[Any].model_validate(decoded)
+                raw = cast(dict[str, Any], decoded)
+                raw_for_handler = raw
 
-            async def typed_handler(
-                _: MessageEnvelope[Any],
-                raw_message: dict[str, Any] = raw,
-            ) -> None:
-                await handler(raw_message)
+                async def typed_handler(
+                    _: MessageEnvelope[Any],
+                    raw_message: dict[str, Any] = raw_for_handler,
+                ) -> None:
+                    await handler(raw_message)
 
-            await consume_with_retry(
-                envelope,
-                typed_handler,
-                dlq,
-                attempts=attempts,
-                delays=delays,
+                await consume_with_retry(
+                    envelope,
+                    typed_handler,
+                    dlq,
+                    attempts=attempts,
+                    delays=delays,
+                )
+            except (json.JSONDecodeError, ValidationError, BusinessMessageError) as exc:
+                await dlq(
+                    {
+                        "original_message": (
+                            raw
+                            if raw is not None
+                            else {
+                                "raw": record.value.decode(
+                                    errors="replace",
+                                )[:4096]
+                            }
+                        ),
+                        "reason": type(exc).__name__,
+                        "attempts": 1,
+                        "correlation_id": (
+                            str(raw.get("correlation_id"))
+                            if raw is not None and raw.get("correlation_id") is not None
+                            else None
+                        ),
+                        "causation_id": (
+                            str(raw.get("causation_id"))
+                            if raw is not None and raw.get("causation_id") is not None
+                            else None
+                        ),
+                    }
+                )
+            await consumer.commit(
+                {
+                    TopicPartition(record.topic, record.partition): record.offset + 1,
+                }
             )
-            await consumer.commit()
     finally:
         await consumer.stop()

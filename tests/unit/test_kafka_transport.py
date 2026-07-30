@@ -1,3 +1,4 @@
+import asyncio
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -66,7 +67,7 @@ class FakeConsumer:
         self.kwargs = kwargs
         self.started = 0
         self.stopped = 0
-        self.committed = 0
+        self.commits: list[object] = []
 
     async def start(self) -> None:
         self.started += 1
@@ -74,8 +75,8 @@ class FakeConsumer:
     async def stop(self) -> None:
         self.stopped += 1
 
-    async def commit(self) -> None:
-        self.committed += 1
+    async def commit(self, offsets: object = None) -> None:
+        self.commits.append(offsets)
 
     def __aiter__(self) -> "FakeConsumer":
         return self
@@ -101,7 +102,16 @@ async def test_consumer_validates_handles_then_commits(
         "order_id": "00000000-0000-0000-0000-000000000703",
         "payload": {"amount_minor": 100, "currency": "RUB"},
     }
-    consumer = FakeConsumer([SimpleNamespace(value=json.dumps(raw).encode())])
+    consumer = FakeConsumer(
+        [
+            SimpleNamespace(
+                value=json.dumps(raw).encode(),
+                topic="payments.commands.v1",
+                partition=0,
+                offset=7,
+            )
+        ]
+    )
     monkeypatch.setattr(kafka, "AIOKafkaConsumer", lambda *args, **kwargs: consumer)
     handled: list[dict[str, Any]] = []
     dlq_records: list[dict[str, Any]] = []
@@ -125,6 +135,152 @@ async def test_consumer_validates_handles_then_commits(
     assert handled == [raw]
     assert dlq_records == []
     assert consumer.started == 1
-    assert consumer.committed == 1
+    assert len(consumer.commits) == 1
     assert consumer.stopped == 1
     assert UUID(handled[0]["message_id"]) == UUID(raw["message_id"])
+
+
+@pytest.mark.asyncio
+async def test_consumer_signals_only_after_broker_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer = FakeConsumer([])
+    monkeypatch.setattr(kafka, "AIOKafkaConsumer", lambda *args, **kwargs: consumer)
+    started = asyncio.Event()
+
+    async def handler(_: dict[str, Any]) -> None:
+        return None
+
+    async def dlq(_: dict[str, Any]) -> None:
+        return None
+
+    await consume_forever(
+        bootstrap_servers="kafka:9092",
+        topics=("payments.commands.v1",),
+        group_id="test-group",
+        handler=handler,
+        dlq=dlq,
+        attempts=1,
+        delays=(0.0,),
+        started_event=started,
+    )
+
+    assert started.is_set()
+    assert consumer.started == 1
+
+
+@pytest.mark.asyncio
+async def test_poison_record_goes_to_dlq_and_next_record_is_processed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    valid = {
+        "message_id": "00000000-0000-0000-0000-000000000711",
+        "message_type": "AuthorizePayment",
+        "schema_version": 1,
+        "occurred_at": "2026-07-30T08:00:00Z",
+        "correlation_id": "00000000-0000-0000-0000-000000000712",
+        "causation_id": None,
+        "order_id": "00000000-0000-0000-0000-000000000713",
+        "payload": {"amount_minor": 100, "currency": "RUB"},
+    }
+    records = [
+        SimpleNamespace(
+            value=b"{invalid-json",
+            topic="payments.commands.v1",
+            partition=0,
+            offset=8,
+        ),
+        SimpleNamespace(
+            value=json.dumps(valid).encode(),
+            topic="payments.commands.v1",
+            partition=0,
+            offset=9,
+        ),
+    ]
+    consumer = FakeConsumer(records)
+    monkeypatch.setattr(kafka, "AIOKafkaConsumer", lambda *args, **kwargs: consumer)
+    handled: list[dict[str, Any]] = []
+    dlq_records: list[dict[str, Any]] = []
+
+    async def handler(record: dict[str, Any]) -> None:
+        handled.append(record)
+
+    async def dlq(record: dict[str, Any]) -> None:
+        dlq_records.append(record)
+
+    await consume_forever(
+        bootstrap_servers="kafka:9092",
+        topics=("payments.commands.v1",),
+        group_id="test-group",
+        handler=handler,
+        dlq=dlq,
+        attempts=1,
+        delays=(0.0,),
+    )
+
+    assert handled == [valid]
+    assert len(dlq_records) == 1
+    assert dlq_records[0]["reason"] == "JSONDecodeError"
+    assert dlq_records[0]["attempts"] == 1
+    assert dlq_records[0]["original_message"] == {"raw": "{invalid-json"}
+    assert len(consumer.commits) == 2
+
+
+@pytest.mark.asyncio
+async def test_business_poison_goes_to_dlq_without_stopping_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unknown = {
+        "message_id": "00000000-0000-0000-0000-000000000721",
+        "message_type": "Unknown",
+        "schema_version": 1,
+        "occurred_at": "2026-07-30T08:00:00Z",
+        "correlation_id": "00000000-0000-0000-0000-000000000722",
+        "causation_id": None,
+        "order_id": "00000000-0000-0000-0000-000000000723",
+        "payload": {},
+    }
+    valid = {**unknown, "message_id": "00000000-0000-0000-0000-000000000724"}
+    records = [
+        SimpleNamespace(
+            value=json.dumps(unknown).encode(),
+            topic="payments.commands.v1",
+            partition=0,
+            offset=10,
+        ),
+        SimpleNamespace(
+            value=json.dumps(valid).encode(),
+            topic="payments.commands.v1",
+            partition=0,
+            offset=11,
+        ),
+    ]
+    consumer = FakeConsumer(records)
+    monkeypatch.setattr(kafka, "AIOKafkaConsumer", lambda *args, **kwargs: consumer)
+    handled: list[dict[str, Any]] = []
+    dlq_records: list[dict[str, Any]] = []
+
+    async def handler(record: dict[str, Any]) -> None:
+        if record["message_id"] == unknown["message_id"]:
+            from libs.messaging.retry import BusinessMessageError
+
+            raise BusinessMessageError("unsupported")
+        handled.append(record)
+
+    async def dlq(record: dict[str, Any]) -> None:
+        dlq_records.append(record)
+
+    await consume_forever(
+        bootstrap_servers="kafka:9092",
+        topics=("payments.commands.v1",),
+        group_id="test-group",
+        handler=handler,
+        dlq=dlq,
+        attempts=1,
+        delays=(0.0,),
+    )
+
+    assert handled == [valid]
+    assert dlq_records[0]["reason"] == "BusinessMessageError"
+    assert dlq_records[0]["correlation_id"] == unknown["correlation_id"]
+    assert len(consumer.commits) == 2

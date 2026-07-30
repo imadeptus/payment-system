@@ -13,7 +13,7 @@ from tests.e2e.conftest import wait_for_order_status
 
 @pytest.mark.e2e
 @pytest.mark.asyncio
-async def test_persisted_outbox_resumes_after_inventory_consumer_restart(
+async def test_kafka_retained_command_resumes_after_inventory_consumer_restart(
     order_client: httpx.AsyncClient,
     order_database: AsyncEngine,
 ) -> None:
@@ -48,16 +48,18 @@ async def test_persisted_outbox_resumes_after_inventory_consumer_restart(
         while asyncio.get_running_loop().time() < deadline:
             async with order_sessions() as session:
                 reserve_command = await session.scalar(
-                    select(Outbox.payload_json).where(
+                    select(Outbox).where(
                         Outbox.payload_json["order_id"].as_string() == str(order_id),
                         Outbox.payload_json["message_type"].as_string()
                         == "ReserveInventory",
                     )
                 )
-            if reserve_command is not None:
+            if reserve_command is not None and reserve_command.published_at is not None:
                 break
             await asyncio.sleep(0.25)
         assert reserve_command is not None
+        assert reserve_command.topic == "inventory.commands.v1"
+        assert reserve_command.published_at is not None
     finally:
         start_process = await asyncio.create_subprocess_exec(
             "docker",

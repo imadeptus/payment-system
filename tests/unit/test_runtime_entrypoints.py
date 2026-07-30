@@ -1,4 +1,6 @@
+import asyncio
 import importlib
+import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from types import ModuleType, SimpleNamespace
@@ -227,6 +229,46 @@ async def test_dlq_publisher_uses_correlation_id_as_key(
     assert b'"message_type":"Unknown"' in value
 
 
+@pytest.mark.asyncio
+async def test_payment_dlq_publishes_deterministic_refund_failure_event(
+    entrypoints: dict[str, ModuleType],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = entrypoints["payment"]
+    publish = AsyncMock()
+    monkeypatch.setattr(module.transport, "publish", publish)
+    refund = envelope(
+        "RefundPayment",
+        {"amount_minor": 100, "currency": "RUB"},
+    )
+
+    await module.publish_dlq(
+        {
+            "original_message": refund,
+            "reason": "TransientMessageError",
+            "attempts": 3,
+            "correlation_id": refund["correlation_id"],
+            "causation_id": refund["causation_id"],
+        }
+    )
+
+    assert publish.await_count == 2
+    failure_call = publish.await_args_list[1]
+    topic, key, value = failure_call.args
+    failure = json.loads(value)
+    assert topic == "payments.events.v1"
+    assert key == failure["message_id"].encode()
+    assert failure["message_type"] == "PaymentRefundFailed"
+    assert failure["correlation_id"] == refund["correlation_id"]
+    assert failure["causation_id"] == refund["message_id"]
+    assert failure["order_id"] == refund["order_id"]
+    assert failure["payload"] == {
+        "amount_minor": 100,
+        "currency": "RUB",
+        "reason": "technical_retry_exhausted",
+    }
+
+
 class FakeConnection:
     async def __aenter__(self) -> "FakeConnection":
         return self
@@ -259,19 +301,36 @@ async def test_service_lifespan_sets_readiness_and_closes_resources(
     module = entrypoints[service]
     engine = FakeEngine()
     transport = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
-    publisher = SimpleNamespace(run=AsyncMock())
-    consume = AsyncMock()
+    worker_blocker = asyncio.Event()
+
+    async def run_publisher(_: asyncio.Event) -> None:
+        await worker_blocker.wait()
+
+    async def run_consumer(**kwargs: Any) -> None:
+        kwargs["started_event"].set()
+        await worker_blocker.wait()
+
+    async def run_supervisor(*_: object, **__: object) -> None:
+        await worker_blocker.wait()
+
+    publisher = SimpleNamespace(run=AsyncMock(side_effect=run_publisher))
+    consume = AsyncMock(side_effect=run_consumer)
+    supervisor = AsyncMock(side_effect=run_supervisor)
     monkeypatch.setattr(module, "engine", engine)
     monkeypatch.setattr(module, "transport", transport)
     monkeypatch.setattr(module, "publisher", publisher)
     monkeypatch.setattr(module, "consume_forever", consume)
+    monkeypatch.setattr(module, "supervise_tasks", supervisor, raising=False)
 
     async with module.lifespan(FastAPI()):
+        await asyncio.sleep(0)
         assert module.readiness.database is True
         assert module.readiness.kafka is True
+        assert isinstance(consume.await_args.kwargs["started_event"], asyncio.Event)
 
     assert module.readiness.database is False
     assert module.readiness.kafka is False
     transport.start.assert_awaited_once()
     transport.stop.assert_awaited_once()
+    supervisor.assert_awaited_once()
     assert engine.disposed == 1

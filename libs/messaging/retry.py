@@ -1,6 +1,7 @@
 """Bounded technical retries and sanitized DLQ records."""
 
 import asyncio
+import random
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
@@ -9,6 +10,10 @@ from libs.contracts import MessageEnvelope
 MessageHandler = Callable[[MessageEnvelope[Any]], Awaitable[None]]
 DlqPublisher = Callable[[dict[str, Any]], Awaitable[None]]
 Sleep = Callable[[float], Awaitable[None]]
+RandomFraction = Callable[[], float]
+
+JITTER_RATIO = 0.2
+JITTER_CAP_SECONDS = 1.0
 
 
 class TransientMessageError(RuntimeError):
@@ -27,6 +32,7 @@ async def consume_with_retry(
     attempts: int = 3,
     delays: Sequence[float] = (1.0, 2.0, 4.0),
     sleep: Sleep = asyncio.sleep,
+    random_fraction: RandomFraction = random.random,
 ) -> None:
     """Retry transient failures and publish a sanitized terminal DLQ record."""
 
@@ -41,7 +47,10 @@ async def consume_with_retry(
         except BusinessMessageError:
             raise
         except TransientMessageError as exc:
-            await sleep(delays[attempt_index])
+            base_delay = delays[attempt_index]
+            fraction = min(max(random_fraction(), 0.0), 1.0)
+            jitter_limit = min(base_delay * JITTER_RATIO, JITTER_CAP_SECONDS)
+            await sleep(base_delay + jitter_limit * fraction)
             terminal_error = exc
         else:
             return

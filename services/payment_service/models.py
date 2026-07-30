@@ -25,6 +25,10 @@ class Payment(Base):
         unique=True,
         index=True,
     )
+    correlation_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        nullable=True,
+    )
     amount_minor: Mapped[int] = mapped_column(Integer, nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)

@@ -13,8 +13,45 @@ from libs.contracts import (
     ReserveInventory,
 )
 from libs.messaging import claim_inbox, enqueue
+from libs.messaging.retry import BusinessMessageError
 from services.order_service.models import Inbox, Order, Outbox, Saga
-from services.order_service.state_machine import SagaState, transition
+from services.order_service.state_machine import (
+    InvalidSagaTransition,
+    SagaState,
+    transition,
+)
+
+PAYMENT_EVENTS = {
+    "PaymentAuthorized",
+    "PaymentRejected",
+    "PaymentRefunded",
+    "PaymentRefundFailed",
+}
+INVENTORY_EVENTS = {
+    "InventoryReserved",
+    "InventoryRejected",
+    "InventoryReleased",
+    "InventoryReleaseFailed",
+}
+
+
+def validate_event_matches_order(
+    order: Order,
+    envelope: MessageEnvelope[Any],
+) -> None:
+    """Reject a validly shaped event that belongs to different business data."""
+
+    payload = envelope.payload
+    if envelope.message_type in PAYMENT_EVENTS and (
+        getattr(payload, "amount_minor", None) != order.amount_minor
+        or getattr(payload, "currency", None) != order.currency
+    ):
+        raise BusinessMessageError("Payment event does not match Order")
+    if envelope.message_type in INVENTORY_EVENTS and (
+        getattr(payload, "sku", None) != order.sku
+        or getattr(payload, "quantity", None) != order.quantity
+    ):
+        raise BusinessMessageError("Inventory event does not match Order")
 
 
 async def handle_saga_event(
@@ -39,12 +76,18 @@ async def handle_saga_event(
             select(Order).where(Order.id == envelope.order_id).with_for_update()
         )
         if saga is None or order is None:
-            raise ValueError(f"Order or Saga not found: {envelope.order_id}")
+            raise BusinessMessageError(
+                f"Order or Saga not found: {envelope.order_id}"
+            )
         if saga.id != envelope.correlation_id:
-            raise ValueError("Event correlation_id does not match Saga")
+            raise BusinessMessageError("Event correlation_id does not match Saga")
+        validate_event_matches_order(order, envelope)
 
         current = SagaState(saga.state)
-        result = transition(current, envelope.message_type)
+        try:
+            result = transition(current, envelope.message_type)
+        except InvalidSagaTransition as exc:
+            raise BusinessMessageError(str(exc)) from exc
         saga.state = result.next_state.value
         saga.history = [
             *saga.history,

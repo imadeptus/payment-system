@@ -4,20 +4,31 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import structlog
 from fastapi import FastAPI
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-from libs.contracts import AuthorizePayment, MessageEnvelope, RefundPayment
+from libs.contracts import (
+    AuthorizePayment,
+    MessageEnvelope,
+    PaymentRefundFailed,
+    RefundPayment,
+)
 from libs.messaging.kafka import KafkaTransport, consume_forever
 from libs.messaging.publisher import OutboxPublisher
 from libs.messaging.retry import BusinessMessageError, TransientMessageError
 from libs.observability import configure_logging
-from libs.runtime import Readiness, add_health_routes
+from libs.runtime import (
+    Readiness,
+    add_health_routes,
+    supervise_tasks,
+    wait_for_worker_start,
+)
 from services.payment_service.config import PaymentSettings
 from services.payment_service.db import build_database
 from services.payment_service.handlers import handle_authorize, handle_refund
@@ -61,9 +72,18 @@ async def process_command(raw: dict[str, Any]) -> None:
                     provider,
                 )
             elif message_type == "RefundPayment":
+                command = MessageEnvelope[RefundPayment].model_validate(raw)
+                if (
+                    settings.refund_transient_failure_amount_minor is not None
+                    and command.payload.amount_minor
+                    == settings.refund_transient_failure_amount_minor
+                ):
+                    raise TransientMessageError(
+                        "simulated_refund_provider_unavailable"
+                    )
                 await handle_refund(
                     session,
-                    MessageEnvelope[RefundPayment].model_validate(raw),
+                    command,
                     provider,
                 )
             else:
@@ -81,19 +101,52 @@ async def publish_dlq(record: dict[str, Any]) -> None:
         key,
         json.dumps(record, separators=(",", ":"), sort_keys=True).encode(),
     )
+    original = record.get("original_message")
+    if (
+        isinstance(original, dict)
+        and original.get("message_type") == "RefundPayment"
+        and record.get("reason") == "TransientMessageError"
+    ):
+        refund = MessageEnvelope[RefundPayment].model_validate(original)
+        failure = MessageEnvelope[PaymentRefundFailed](
+            message_id=uuid5(
+                NAMESPACE_URL,
+                f"payment-refund-failed:{refund.message_id}",
+            ),
+            message_type="PaymentRefundFailed",
+            occurred_at=datetime.now(UTC),
+            correlation_id=refund.correlation_id,
+            causation_id=refund.message_id,
+            order_id=refund.order_id,
+            payload=PaymentRefundFailed(
+                amount_minor=refund.payload.amount_minor,
+                currency=refund.payload.currency,
+                reason="technical_retry_exhausted",
+            ),
+        )
+        await transport.publish(
+            settings.payment_events_topic,
+            str(failure.message_id).encode(),
+            json.dumps(
+                failure.model_dump(mode="json"),
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode(),
+        )
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     stop_event = asyncio.Event()
-    tasks: list[asyncio.Task[None]] = []
+    worker_tasks: list[asyncio.Task[None]] = []
+    supervisor_task: asyncio.Task[None] | None = None
     try:
         async with engine.connect() as connection:
             await connection.execute(text("SELECT 1"))
         readiness.database = True
         await transport.start()
-        readiness.kafka = True
-        tasks = [
+        consumer_started = asyncio.Event()
+        worker_tasks = [
             asyncio.create_task(publisher.run(stop_event), name="payment-outbox"),
             asyncio.create_task(
                 consume_forever(
@@ -103,23 +156,33 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
                     handler=process_command,
                     dlq=publish_dlq,
                     attempts=settings.message_retry_attempts,
-                    delays=tuple(
-                        float(value)
-                        for value in settings.message_backoff_seconds.split(",")
-                    ),
+                    delays=settings.backoff_delays,
+                    started_event=consumer_started,
                 ),
                 name="payment-consumer",
             ),
         ]
+        await wait_for_worker_start(consumer_started, worker_tasks)
+        readiness.kafka = True
+        supervisor_task = asyncio.create_task(
+            supervise_tasks(worker_tasks, readiness),
+            name="payment-supervisor",
+        )
         logger.info("service_started")
         yield
     finally:
         readiness.kafka = False
         readiness.database = False
         stop_event.set()
-        for task in tasks:
+        if supervisor_task is not None:
+            supervisor_task.cancel()
+        for task in worker_tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(
+            *worker_tasks,
+            *([supervisor_task] if supervisor_task is not None else []),
+            return_exceptions=True,
+        )
         await transport.stop()
         await engine.dispose()
         logger.info("service_stopped")

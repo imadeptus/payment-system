@@ -1,8 +1,11 @@
+import asyncio
+
 import httpx
 import pytest
 from fastapi import FastAPI
 from pydantic import ValidationError
 
+from libs import runtime
 from libs.contracts import topic_for
 from libs.runtime import Readiness, add_health_routes
 from services.inventory_service.config import InventorySettings
@@ -47,6 +50,89 @@ def test_topic_names_are_overridden_from_environment(monkeypatch: pytest.MonkeyP
     assert topic_for("AuthorizePayment") == "custom.payment.commands"
 
 
+@pytest.mark.parametrize(
+    ("settings_class", "database_field"),
+    [
+        (OrderSettings, "order_database_url"),
+        (PaymentSettings, "payment_database_url"),
+        (InventorySettings, "inventory_database_url"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("message_retry_attempts", 0),
+        ("message_backoff_seconds", "1,broken,4"),
+        ("message_backoff_seconds", "1,-2,4"),
+        ("outbox_poll_seconds", 0),
+        ("outbox_batch_size", 0),
+    ],
+)
+def test_runtime_settings_reject_non_positive_or_invalid_values(
+    settings_class: type,
+    database_field: str,
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValidationError):
+        settings_class(
+            _env_file=None,
+            **{
+                database_field: "postgresql+asyncpg://user:secret@db/service",
+                "kafka_bootstrap_servers": "kafka:9092",
+                field: value,
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    ("settings_class", "database_field"),
+    [
+        (OrderSettings, "order_database_url"),
+        (PaymentSettings, "payment_database_url"),
+        (InventorySettings, "inventory_database_url"),
+    ],
+)
+def test_runtime_settings_validate_backoff_length_at_startup(
+    settings_class: type,
+    database_field: str,
+) -> None:
+    with pytest.raises(ValidationError, match="one delay is required for every attempt"):
+        settings_class(
+            _env_file=None,
+            **{
+                database_field: "postgresql+asyncpg://user:secret@db/service",
+                "kafka_bootstrap_servers": "kafka:9092",
+                "message_retry_attempts": 3,
+                "message_backoff_seconds": "1,2",
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    ("settings_class", "database_field"),
+    [
+        (OrderSettings, "order_database_url"),
+        (PaymentSettings, "payment_database_url"),
+        (InventorySettings, "inventory_database_url"),
+    ],
+)
+def test_runtime_settings_parse_backoff_once_at_startup(
+    settings_class: type,
+    database_field: str,
+) -> None:
+    settings = settings_class(
+        _env_file=None,
+        **{
+            database_field: "postgresql+asyncpg://user:secret@db/service",
+            "kafka_bootstrap_servers": "kafka:9092",
+            "message_backoff_seconds": "0.5,1,2",
+        },
+    )
+
+    assert settings.backoff_delays == (0.5, 1.0, 2.0)
+
+
 @pytest.mark.asyncio
 async def test_readiness_requires_both_database_and_kafka() -> None:
     readiness = Readiness()
@@ -66,3 +152,35 @@ async def test_readiness_requires_both_database_and_kafka() -> None:
     assert before.status_code == 503
     assert middle.status_code == 503
     assert after.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_background_failure_degrades_readiness_and_requests_restart() -> None:
+    readiness = Readiness(database=True, kafka=True)
+    terminated: list[bool] = []
+
+    async def failed_worker() -> None:
+        raise RuntimeError("consumer stopped")
+
+    worker = asyncio.create_task(failed_worker(), name="failed-consumer")
+    await runtime.supervise_tasks(
+        [worker],
+        readiness,
+        terminate=lambda: terminated.append(True),
+    )
+
+    assert readiness.kafka is False
+    assert terminated == [True]
+
+
+@pytest.mark.asyncio
+async def test_worker_startup_propagates_failure_before_readiness() -> None:
+    started = asyncio.Event()
+
+    async def failed_worker() -> None:
+        raise ConnectionError("broker unavailable")
+
+    worker = asyncio.create_task(failed_worker(), name="failed-startup")
+
+    with pytest.raises(ConnectionError, match="broker unavailable"):
+        await runtime.wait_for_worker_start(started, [worker])

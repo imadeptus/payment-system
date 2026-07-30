@@ -16,7 +16,12 @@ from libs.messaging.kafka import KafkaTransport, consume_forever
 from libs.messaging.publisher import OutboxPublisher
 from libs.messaging.retry import BusinessMessageError, TransientMessageError
 from libs.observability import configure_logging
-from libs.runtime import Readiness, add_health_routes
+from libs.runtime import (
+    Readiness,
+    add_health_routes,
+    supervise_tasks,
+    wait_for_worker_start,
+)
 from services.inventory_service.config import InventorySettings
 from services.inventory_service.db import build_database
 from services.inventory_service.handlers import handle_release, handle_reserve
@@ -76,14 +81,15 @@ async def publish_dlq(record: dict[str, Any]) -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     stop_event = asyncio.Event()
-    tasks: list[asyncio.Task[None]] = []
+    worker_tasks: list[asyncio.Task[None]] = []
+    supervisor_task: asyncio.Task[None] | None = None
     try:
         async with engine.connect() as connection:
             await connection.execute(text("SELECT 1"))
         readiness.database = True
         await transport.start()
-        readiness.kafka = True
-        tasks = [
+        consumer_started = asyncio.Event()
+        worker_tasks = [
             asyncio.create_task(publisher.run(stop_event), name="inventory-outbox"),
             asyncio.create_task(
                 consume_forever(
@@ -93,23 +99,33 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
                     handler=process_command,
                     dlq=publish_dlq,
                     attempts=settings.message_retry_attempts,
-                    delays=tuple(
-                        float(value)
-                        for value in settings.message_backoff_seconds.split(",")
-                    ),
+                    delays=settings.backoff_delays,
+                    started_event=consumer_started,
                 ),
                 name="inventory-consumer",
             ),
         ]
+        await wait_for_worker_start(consumer_started, worker_tasks)
+        readiness.kafka = True
+        supervisor_task = asyncio.create_task(
+            supervise_tasks(worker_tasks, readiness),
+            name="inventory-supervisor",
+        )
         logger.info("service_started")
         yield
     finally:
         readiness.kafka = False
         readiness.database = False
         stop_event.set()
-        for task in tasks:
+        if supervisor_task is not None:
+            supervisor_task.cancel()
+        for task in worker_tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(
+            *worker_tasks,
+            *([supervisor_task] if supervisor_task is not None else []),
+            return_exceptions=True,
+        )
         await transport.stop()
         await engine.dispose()
         logger.info("service_stopped")

@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any
 
 import httpx
@@ -55,3 +56,45 @@ async def test_post_orders_replays_same_result_without_duplicate_side_effects(
 
     assert counts == {"orders": 1, "sagas": 1, "keys": 1, "outbox": 1}
     assert outbox_payload["message_type"] == "AuthorizePayment"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_concurrent_same_idempotency_key_returns_one_order(
+    postgres_engine: AsyncEngine,
+) -> None:
+    async with postgres_engine.begin() as connection:
+        await connection.run_sync(Base.metadata.drop_all)
+        await connection.run_sync(Base.metadata.create_all)
+
+    session_factory = async_sessionmaker(postgres_engine, expire_on_commit=False)
+    app = create_app(session_factory)
+    transport = httpx.ASGITransport(app=app)
+    payload = {
+        "sku": "IN-STOCK",
+        "quantity": 1,
+        "amount_minor": 500,
+        "currency": "RUB",
+    }
+    headers = {"Idempotency-Key": "order-api-concurrent-001"}
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first, second = await asyncio.gather(
+            client.post("/orders", json=payload, headers=headers),
+            client.post("/orders", json=payload, headers=headers),
+        )
+
+    assert sorted([first.status_code, second.status_code]) == [200, 202]
+    assert first.json()["order_id"] == second.json()["order_id"]
+
+    async with session_factory() as session:
+        counts = {
+            "orders": await session.scalar(select(func.count()).select_from(Order)),
+            "sagas": await session.scalar(select(func.count()).select_from(Saga)),
+            "keys": await session.scalar(
+                select(func.count()).select_from(IdempotencyRecord)
+            ),
+            "outbox": await session.scalar(select(func.count()).select_from(Outbox)),
+        }
+
+    assert counts == {"orders": 1, "sagas": 1, "keys": 1, "outbox": 1}

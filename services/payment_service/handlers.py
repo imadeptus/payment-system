@@ -16,6 +16,7 @@ from libs.contracts import (
     RefundPayment,
 )
 from libs.messaging import claim_inbox, enqueue
+from libs.messaging.retry import BusinessMessageError
 from services.payment_service.models import Inbox, Outbox, Payment
 from services.payment_service.provider import PaymentProvider
 
@@ -54,6 +55,7 @@ async def handle_authorize(
         session.add(
             Payment(
                 order_id=envelope.order_id,
+                correlation_id=envelope.correlation_id,
                 amount_minor=envelope.payload.amount_minor,
                 currency=envelope.payload.currency,
                 status=status,
@@ -115,9 +117,19 @@ async def handle_refund(
             select(Payment).where(Payment.order_id == envelope.order_id).with_for_update()
         )
         if payment is None:
-            raise ValueError(f"Payment not found for order {envelope.order_id}")
+            raise BusinessMessageError(
+                f"Payment not found for order {envelope.order_id}"
+            )
+        if (
+            payment.correlation_id != envelope.correlation_id
+            or payment.amount_minor != envelope.payload.amount_minor
+            or payment.currency != envelope.payload.currency
+        ):
+            raise BusinessMessageError("RefundPayment does not match stored Payment")
         if payment.status in {"REFUNDED", "REFUND_FAILED"}:
             return
+        if payment.status != "AUTHORIZED":
+            raise BusinessMessageError("Payment is not authorized for refund")
 
         result = provider.refund(envelope.order_id, envelope.payload.amount_minor)
         payment.status = "REFUNDED" if result.approved else "REFUND_FAILED"
