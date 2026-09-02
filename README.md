@@ -1,5 +1,7 @@
 # Payment System Saga
 
+[![CI](https://github.com/imadeptus/payment-system/actions/workflows/ci.yml/badge.svg)](https://github.com/imadeptus/payment-system/actions/workflows/ci.yml)
+
 Event-driven payment workflow with an orchestration-based Saga, compensating
 refund, Transactional Outbox, idempotent Inbox, Kafka retry/DLQ and
 failure-path tests.
